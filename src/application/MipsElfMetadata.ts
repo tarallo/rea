@@ -3,11 +3,14 @@ import type {
   MipsAbiFlags,
   MipsElfMetadata,
 } from "../domain/binaryTargetTypes.js";
+import { readElfFixedHeader } from "../domain/elfFixedHeader.js";
 import { err, ok, type Result } from "../domain/result.js";
 import {
   readMipsElfSharedLoad,
   type MipsElfRelocationSection,
 } from "./MipsElfSharedLoad.js";
+
+const SHT_GNU_ATTRIBUTES = 0x6ffffff5;
 
 /** Observed ABI and load declarations, retaining unavailable source coverage. */
 export interface MipsElfInspection {
@@ -64,21 +67,22 @@ export const readMipsElfMetadata = async (
   const header = await read(0, 52, "ELF32 header");
   if (!header.ok) return header;
   const bytes = header.value;
+  const fixedHeader = readElfFixedHeader(bytes, fileSize);
+  if (!fixedHeader.ok) return fixedHeader;
   const little = metadata.byteOrder === "little";
   const u16 = (data: Buffer, offset: number): number =>
     little ? data.readUInt16LE(offset) : data.readUInt16BE(offset);
   const u32 = (data: Buffer, offset: number): number =>
     little ? data.readUInt32LE(offset) : data.readUInt32BE(offset);
   if (
-    bytes.toString("hex", 0, 4) !== "7f454c46" ||
-    bytes[4] !== 1 ||
-    bytes[5] !== (little ? 1 : 2) ||
+    fixedHeader.value.elfClass !== 32 ||
+    fixedHeader.value.byteOrder !== metadata.byteOrder ||
     u16(bytes, 18) !== 8 ||
     u16(bytes, 16) !== metadata.type ||
     u32(bytes, 36) !== metadata.flags
   )
     return err("MIPS ELF header no longer matches the resolved identity");
-  if (bytes[6] !== 1 || u32(bytes, 20) !== 1 || u16(bytes, 40) !== 52)
+  if (fixedHeader.value.headerSize !== 52)
     return err("invalid MIPS ELF32 version or header size");
 
   const tables = [
@@ -149,6 +153,10 @@ export const readMipsElfMetadata = async (
       checkCancelled();
       const position = i * table.entrySize;
       const type = u32(contents.value, position + table.typeOffset);
+      if (table.optional && type === SHT_GNU_ATTRIBUTES)
+        return err(
+          "MIPS ELF declares GNU ABI attributes that REA does not inspect; refusing provider selection until the declared ABI is parsed and reconciled",
+        );
       if (metadata.type === 3 && table.optional && (type === 4 || type === 9))
         relocationSections.push({
           type,

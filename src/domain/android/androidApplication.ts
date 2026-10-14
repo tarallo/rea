@@ -1,6 +1,9 @@
 import { z } from "zod";
 
-import { parseArtifactInventoryEvidence } from "../artifactInventoryEvidence.js";
+import {
+  hasCompleteInventoryCoverage,
+  parseArtifactInventoryEvidence,
+} from "../artifactInventoryEvidence.js";
 import { digestSchema } from "../digests.js";
 import { prefixedDigestSchema } from "../digests.js";
 import { nativeRuntimeConvention } from "../nativeConvention.js";
@@ -15,6 +18,8 @@ import {
   projectionCoverage,
   projectionDigest,
   projectionEvidenceIdSchema,
+  unavailableComponentSchema,
+  unavailableComponents,
 } from "../mobileApplicationGraphProjection.js";
 
 const evidenceIdSchema = projectionEvidenceIdSchema;
@@ -39,6 +44,7 @@ export const androidApplicationProjectionResultSchema = z.strictObject({
     javascript: z.array(componentSchema),
     signing: z.array(componentSchema),
   }),
+  unavailable_components: z.array(unavailableComponentSchema),
   runtime_families: z.array(
     z.enum([
       "dalvik-art",
@@ -62,9 +68,10 @@ export const androidApplicationProjectionResultSchema = z.strictObject({
   bridge_candidate_coverage: bridgeCandidateCoverageSchema,
   coverage: z.strictObject({
     status: z.enum(["complete-within-inventory", "partial"]),
+    // Count completeness is separate from the declared coverage status.
     inventory_complete: z.boolean(),
   }),
-  limitations: z.array(z.string().min(1)),
+  limitations: z.array(z.string()),
 });
 
 export type AndroidApplicationProjectionInput = z.infer<
@@ -88,6 +95,7 @@ export const projectAndroidApplication = (
       `Android application projection requires APK inventory Evidence; the inventory root format is ${inventory.manifest.root_format}. APK is chosen for a ZIP archive whose name ends in .apk.`,
     );
   const all = projectedComponents(inventory);
+  const unavailable = unavailableComponents(inventory);
   const classified = classify(all);
   const bridgeProjection = bridgeCandidates(
     [...classified.dex, ...classified.jvm_classes],
@@ -95,8 +103,9 @@ export const projectAndroidApplication = (
   );
   const components = classified;
   const limitations = [
-    ...(!inventory.complete
-      ? ["Source inventory pages are incomplete; absence is unknown."]
+    ...inventory.limitations,
+    ...(!hasCompleteInventoryCoverage(inventory, "container-entries")
+      ? ["Source inventory coverage is partial; absence is unknown."]
       : []),
     "Manifest, resource, signing, and bytecode semantics require a dedicated Android provider; this projection reports exact inventory paths and hashes only.",
     "Runtime families are inferred from inventory formats and paths; filename suffixes do not establish valid DEX or JVM class bytes.",
@@ -113,6 +122,11 @@ export const projectAndroidApplication = (
           `Bridge candidate pairs exceeded the projection safety budget; ${bridgeProjection.coverage.omitted_candidates} hypotheses are omitted. Component arrays still include every component from the supplied inventory pages.`,
         ]
       : []),
+    ...(unavailable.length > 0
+      ? [
+          "Some inventoried occurrences have no authenticated content identity. Their paths and limitations are retained in unavailable_components; component absence is unknown.",
+        ]
+      : []),
   ];
   const withoutId = {
     root_sha256: inventory.manifest.root_sha256,
@@ -121,12 +135,14 @@ export const projectAndroidApplication = (
       .map(({ evidence_id: id }) => id)
       .sort(compareProjectionStrings),
     components,
+    unavailable_components: unavailable,
     runtime_families: runtimeFamilies(all),
     bridge_candidates: bridgeProjection.candidates,
     bridge_candidate_coverage: bridgeProjection.coverage,
     coverage: projectionCoverage(
       inventory,
-      bridgeProjection.coverage.status === "complete",
+      bridgeProjection.coverage.status === "complete" &&
+        unavailable.length === 0,
     ),
     limitations,
   };

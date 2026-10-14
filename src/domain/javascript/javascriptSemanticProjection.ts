@@ -27,7 +27,17 @@ import { range } from "./javascriptStaticAnalysisHelpers.js";
 import {
   propertyName,
   semanticStaticPropertyKey,
+  semanticWrappedWriteSite,
+  semanticWriteSiteReadsFirst,
+  semanticWriteSiteTarget,
+  unwrapJavaScriptExpression,
 } from "./javascriptAstValues.js";
+import {
+  isTypeOnlyExportDeclaration,
+  isTypeOnlyExportSpecifier,
+  isTypeOnlyImportDeclaration,
+  isTypeOnlyImportSpecifier,
+} from "./javascriptModuleDeclaration.js";
 
 interface CollectCallableInput {
   readonly node: t.Node;
@@ -75,7 +85,7 @@ export const collectSemanticModuleLink = (
     addModuleLink(
       state,
       {
-        kind: "re-export",
+        kind: isTypeOnlyExportDeclaration(node) ? "type-import" : "re-export",
         specifier: node.source.value,
         importedName: "*",
         localName: null,
@@ -108,12 +118,19 @@ const collectImportEquals = (
   node: t.TSImportEqualsDeclaration,
   state: JavaScriptSemanticAnalysisState,
 ): void => {
-  const specifier = semanticImportEqualsSpecifier(node);
+  const moduleReference = node.moduleReference;
+  const specifier =
+    semanticImportEqualsSpecifier(node) ??
+    (node.importKind === "type" &&
+    t.isTSExternalModuleReference(moduleReference) &&
+    t.isStringLiteral(moduleReference.expression)
+      ? moduleReference.expression.value
+      : null);
   if (specifier === null) return;
   addModuleLink(
     state,
     {
-      kind: "require",
+      kind: node.importKind === "type" ? "type-import" : "require",
       specifier,
       importedName: null,
       localName: node.id.name,
@@ -162,12 +179,17 @@ export function* collectSemanticReferencesSteps(
           !patterns.some((pattern) => bindsIdentifier(pattern, parent, node)))
       )
         return;
-      const role = semanticIdentifierRole(node, parent, readAncestors());
+      const ancestors = readAncestors();
+      const role = semanticIdentifierRole(node, parent, ancestors);
       if (role === null) return;
       // A compound assignment or update reads before it writes; emit both so
       // reference consumers see the read they actually execute.
       const roles =
-        role === "write" && semanticReadsBeforeWrite(node, parent)
+        role === "write" &&
+        semanticReadsBeforeWrite(
+          node,
+          semanticWrappedWriteSite(node, parent, ancestors) ?? parent,
+        )
           ? (["read", "write"] as const)
           : ([role] as const);
       for (const resolvedRole of roles) {
@@ -287,7 +309,7 @@ const collectImports = (
     addModuleLink(
       state,
       {
-        kind: "import",
+        kind: isTypeOnlyImportDeclaration(node) ? "type-import" : "import",
         specifier: node.source.value,
         importedName: null,
         localName: null,
@@ -300,7 +322,12 @@ const collectImports = (
     addModuleLink(
       state,
       {
-        kind: "import",
+        kind:
+          isTypeOnlyImportDeclaration(node) ||
+          (t.isImportSpecifier(specifier) &&
+            isTypeOnlyImportSpecifier(specifier))
+            ? "type-import"
+            : "import",
         specifier: node.source.value,
         importedName: t.isImportDefaultSpecifier(specifier)
           ? "default"
@@ -319,12 +346,13 @@ const collectNamedExports = (
   node: t.ExportNamedDeclaration,
   state: JavaScriptSemanticAnalysisState,
 ): void => {
+  const declarationTypeOnly = isTypeOnlyExportDeclaration(node);
   if (node.declaration !== null && node.declaration !== undefined)
     for (const localName of declarationNames(node.declaration))
       addModuleLink(
         state,
         {
-          kind: "export",
+          kind: declarationTypeOnly ? "type-import" : "export",
           specifier: null,
           importedName: null,
           localName,
@@ -342,7 +370,14 @@ const collectNamedExports = (
       addModuleLink(
         state,
         {
-          kind: node.source == null ? "export" : "re-export",
+          kind:
+            declarationTypeOnly ||
+            (t.isExportSpecifier(specifier) &&
+              isTypeOnlyExportSpecifier(specifier))
+              ? "type-import"
+              : node.source == null
+                ? "export"
+                : "re-export",
           specifier: node.source?.value ?? null,
           importedName: t.isExportNamespaceSpecifier(specifier)
             ? "*"
@@ -507,7 +542,20 @@ const addModuleLink = (
   },
   referenceNode: t.Node,
 ): void => {
-  const collected = { ...link, callableId: link.callableId ?? null };
+  const resolutionMode =
+    link.resolutionMode ??
+    (link.kind === "import" ||
+    link.kind === "re-export" ||
+    link.kind === "type-import"
+      ? state.staticImportResolutionMode
+      : link.kind === "require"
+        ? "require"
+        : undefined);
+  const collected = {
+    ...link,
+    ...(resolutionMode === undefined ? {} : { resolutionMode }),
+    callableId: link.callableId ?? null,
+  };
   state.moduleLinks.push(collected);
   if (link.localName !== null) {
     const binding = resolveSemanticBindingState(
@@ -555,12 +603,15 @@ const declarationCallableId = (
  */
 export const semanticReadsBeforeWrite = (
   node: t.Node,
-  parent: t.Node,
-): boolean =>
-  (t.isAssignmentExpression(parent) &&
-    parent.left === node &&
-    parent.operator !== "=") ||
-  (t.isUpdateExpression(parent) && parent.argument === node);
+  site: t.Node,
+): boolean => {
+  const target = semanticWriteSiteTarget(site);
+  return (
+    target !== null &&
+    unwrapJavaScriptExpression(target).node === node &&
+    semanticWriteSiteReadsFirst(site)
+  );
+};
 
 /**
  * Role of one identifier occurrence, given the node's ancestry.
@@ -581,6 +632,8 @@ export const semanticIdentifierRole = (
     if (isPatternOwnerDeclaration(patternAncestor)) return null;
     return "write";
   }
+  const site = semanticWrappedWriteSite(node, parent, ancestors);
+  if (site !== null && site !== parent && !isDeleteSite(site)) return "write";
   return semanticReferenceRole(node, parent);
 };
 
@@ -644,6 +697,9 @@ const isPatternNode = (node: t.Node): boolean =>
   t.isArrayPattern(node) ||
   t.isAssignmentPattern(node) ||
   t.isRestElement(node);
+
+const isDeleteSite = (site: t.Node): boolean =>
+  t.isUnaryExpression(site, { operator: "delete" });
 
 const isPatternOwnerDeclaration = (node: t.Node): boolean =>
   (t.isVariableDeclarator(node) && t.isPattern(node.id)) ||
@@ -746,6 +802,13 @@ const declarationNames = (declaration: t.Declaration): string[] => {
   )
     return [declaration.id.name];
   if (
+    (t.isTSInterfaceDeclaration(declaration) ||
+      t.isTSTypeAliasDeclaration(declaration) ||
+      t.isTSDeclareFunction(declaration)) &&
+    t.isIdentifier(declaration.id)
+  )
+    return [declaration.id.name];
+  if (
     t.isTSImportEqualsDeclaration(declaration) &&
     semanticImportEqualsSpecifier(declaration) !== null
   )
@@ -769,16 +832,15 @@ const commonJsExportName = (
   if (!t.isMemberExpression(node) && !t.isOptionalMemberExpression(node))
     return undefined;
   const key = semanticStaticPropertyKey(node.property, node.computed);
-  // `exports[key]`/`module.exports[key]` assign an export whose name is not
-  // knowable. Report the wildcard rather than the variable name, and never
-  // collapse it into `default`, which would claim a real default export.
+  // A computed nonliteral key is unknown, but the empty string is a real exact
+  // CommonJS export name and must not collapse into the wildcard/default.
   if (isUnshadowedGlobal(node.object, state, "exports"))
-    return key === null ? "*" : key || "*";
+    return key === null ? "*" : key;
   if (
     t.isMemberExpression(node.object) &&
     isCommonJsModuleExports(node.object, state)
   )
-    return key === null ? "*" : key || "default";
+    return key === null ? "*" : key;
   if (isCommonJsModuleExports(node, state)) return "default";
   return undefined;
 };

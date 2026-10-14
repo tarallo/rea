@@ -17,7 +17,10 @@ import {
   isSwiftRuntimeLibrary,
   nativeRuntimeConvention,
 } from "../nativeConvention.js";
-import { parseArtifactInventoryEvidence } from "../artifactInventoryEvidence.js";
+import {
+  hasCompleteInventoryCoverage,
+  parseArtifactInventoryEvidence,
+} from "../artifactInventoryEvidence.js";
 import { evidenceSchema } from "../evidence.js";
 import { digestSchema } from "../digests.js";
 import { prefixedDigestSchema } from "../digests.js";
@@ -88,9 +91,10 @@ export const appleApplicationProjectionResultSchema = z.strictObject({
   bridge_candidate_coverage: bridgeCandidateCoverageSchema,
   coverage: z.strictObject({
     status: z.enum(["complete-within-inventory", "partial"]),
+    // Count completeness is separate from the declared coverage status.
     inventory_complete: z.boolean(),
   }),
-  limitations: z.array(z.string().min(1)),
+  limitations: z.array(z.string()),
 });
 
 export type AppleApplicationProjectionInput = z.infer<
@@ -165,17 +169,24 @@ export const projectAppleApplication = (
   );
   const uninventoriedImage =
     rootFormat === "dmg" && inventory.occurrences.length === 1;
-  const complete = inventory.complete && !uninventoriedImage;
-  const limitations = projectionLimitations({
-    complete: inventory.complete,
-    uninventoriedImage,
-    roots,
-    bundles,
-    sidecars: entries.some(({ path }) => isSidecar(path)),
-    symlinks: entries.some(({ kind }) => kind === "symlink"),
-    unattributed,
-    bridgeCandidateCoverage: bridgeProjection.coverage,
-  });
+  const inventoryComplete = hasCompleteInventoryCoverage(
+    inventory,
+    "container-entries",
+  );
+  const complete = inventoryComplete && !uninventoriedImage;
+  const limitations = [
+    ...inventory.limitations,
+    ...projectionLimitations({
+      complete: inventoryComplete,
+      uninventoriedImage,
+      roots,
+      bundles,
+      sidecars: entries.some(({ path }) => isSidecar(path)),
+      symlinks: entries.some(({ kind }) => kind === "symlink"),
+      unattributed,
+      bridgeCandidateCoverage: bridgeProjection.coverage,
+    }),
+  ];
   const withoutId = {
     root_sha256: inventory.manifest.root_sha256,
     root_format: rootFormat,
@@ -213,8 +224,9 @@ export const appleProjectionId = (projection: unknown): string =>
   `aap_${digest(projection)}`;
 
 /**
- * IPA projection keeps every archive component, as before. Directory, ZIP,
- * and DMG inventories can hold installers and other siblings, so only
+ * AppleDouble sidecars describe neighbouring files and are never components.
+ * IPA projection keeps every other archive component, as before. Directory,
+ * ZIP, and DMG inventories can hold installers and other siblings, so only
  * components inside an application root are attributed to it.
  */
 const attributeComponents = (
@@ -222,8 +234,8 @@ const attributeComponents = (
   roots: readonly string[],
   rootFormat: RootFormat,
 ): { readonly all: Component[]; readonly unattributed: number } => {
-  if (rootFormat === "ipa") return { all: [...inventoried], unattributed: 0 };
   const visible = inventoried.filter(({ path }) => !isSidecar(path));
+  if (rootFormat === "ipa") return { all: visible, unattributed: 0 };
   const all = visible.filter(({ path }) =>
     roots.some((root) => isWithin(path, root)),
   );
@@ -390,7 +402,7 @@ const projectionLimitations = (facts: {
   readonly bridgeCandidateCoverage: AppleApplicationProjectionResult["bridge_candidate_coverage"];
 }): string[] => [
   ...(!facts.complete
-    ? ["Source inventory pages are incomplete; absence is unknown."]
+    ? ["Source inventory coverage is partial; absence is unknown."]
     : []),
   ...(facts.uninventoriedImage
     ? [

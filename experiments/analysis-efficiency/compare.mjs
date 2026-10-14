@@ -27,6 +27,7 @@ const sameSettings = [
   "retained_verification",
   "native_question",
   "javascript_question",
+  "managed_question",
   "provider_settings_sha256",
   "provider_search_path_sha256",
   "provider_environment_policy_sha256",
@@ -68,6 +69,44 @@ for (const [side, answer] of [
       path: ["evidence_ids"],
       value: answer.evidence_ids,
     });
+}
+// PCAP delivery observations preserve each actual receipt's identity, limitations
+// and view coverage. Summary/page scopes differ from complete source scope;
+// retain them separately rather than equating page exhaustion with capture
+// coverage. Repeated equivalent deliveries must also match every observation
+// field except the receipt and parent IDs, which identify their own invocations.
+if (
+  ["wireshark-http.cap", "wireshark-http_redirects.pcapng"].includes(
+    left.artifact,
+  )
+) {
+  for (const [side, answer] of [
+    ["left", a],
+    ["right", b],
+  ]) {
+    if (
+      !Array.isArray(answer.delivery_observations) ||
+      !answer.delivery_observations.length
+    )
+      throw new Error("Missing original PCAP delivery observations");
+    runSpecific.push({
+      side,
+      path: ["delivery_observations"],
+      value: answer.delivery_observations,
+    });
+    if (left.delivery === right.delivery) {
+      answer.delivery_observations = answer.delivery_observations.map(
+        (observation) =>
+          Object.fromEntries(
+            Object.entries(observation).filter(
+              ([key]) => key !== "evidence_id" && key !== "parent_evidence_id",
+            ),
+          ),
+      );
+    } else {
+      delete answer.delivery_observations;
+    }
+  }
 }
 // Binwalk assigns a new opaque region UUID in each invocation. Preserve both
 // original lookup values in this report; compare the observed region facts

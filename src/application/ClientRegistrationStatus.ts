@@ -7,15 +7,18 @@ import {
   clientServerForcedEnabled,
   clientServerListedDisabled,
   effectiveClientServer,
+  type ClientConfigurationDocument,
 } from "./ClientConfigurationDocument.js";
 import { access } from "node:fs/promises";
 import { resolve } from "node:path";
 
 import { z } from "zod";
+import { valid } from "semver";
 
 import { PRODUCT_IDENTITY } from "../identity.js";
 import { MCP_STARTUP_POLICY } from "../mcpStartupPolicy.js";
 import {
+  clientRegistrationPackageReference,
   isOwnedClientRegistrationCommand,
   packageRunnerRegistrationCommand,
 } from "./ClientRegistrationIdentity.js";
@@ -32,6 +35,8 @@ import type { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.j
 interface ClientRegistrationStatusBase {
   readonly client: string;
   readonly config_path: string;
+  /** Exact package reference requested by npx/bunx, when registration uses one. */
+  readonly package_reference?: string;
 }
 
 type RegistrationCommand = readonly [string, ...string[]];
@@ -65,6 +70,8 @@ const registrationSchema = z
     command: z.string().min(1),
     args: z.array(z.string()).default([]),
     startup_timeout_sec: z.number().positive().optional(),
+    startupTimeoutMs: z.number().positive().optional(),
+    toolTimeoutMs: z.number().positive().optional(),
     type: z.string().optional(),
     transport: z.string().optional(),
     serverName: z.string().optional(),
@@ -74,24 +81,48 @@ const registrationSchema = z
   })
   .passthrough();
 
-/** Inspect supported client registrations without reading their environment. */
+interface ClientRegistrationReadOptions {
+  readonly platform?: NodeJS.Platform;
+  readonly environment?: NodeJS.ProcessEnv;
+  readonly resources?: ArtifactResourceScope;
+}
+
+/** Registration facts shared by diagnostics and update maintenance. */
+export interface ClientRegistrationInspection {
+  readonly status: ClientRegistrationStatus;
+  readonly activation: "enabled" | "disabled" | "unknown";
+}
+
+/** Project diagnostics from the same inspection used to select maintenance. */
 export const readClientRegistrationStatuses = async (
   home: string,
   currentCommandPath: string = resolve(process.argv[1] ?? "unknown"),
-  options: {
-    readonly platform?: NodeJS.Platform;
-    readonly environment?: NodeJS.ProcessEnv;
-    readonly resources?: ArtifactResourceScope;
-  } = {},
-): Promise<readonly ClientRegistrationStatus[]> => {
-  const statuses: ClientRegistrationStatus[] = [];
+  options: ClientRegistrationReadOptions = {},
+): Promise<readonly ClientRegistrationStatus[]> =>
+  (
+    await readClientRegistrationInspections(home, currentCommandPath, options)
+  ).map(({ status }) => status);
+
+/** Parse effective registrations and their client-specific activation once. */
+export const readClientRegistrationInspections = async (
+  home: string,
+  currentCommandPath: string = resolve(process.argv[1] ?? "unknown"),
+  options: ClientRegistrationReadOptions = {},
+): Promise<readonly ClientRegistrationInspection[]> => {
+  const inspections: ClientRegistrationInspection[] = [];
+  const record = (
+    status: ClientRegistrationStatus,
+    activation: ClientRegistrationInspection["activation"] = "unknown",
+  ): void => {
+    inspections.push({ status, activation });
+  };
   for (const client of supportedClients(
     home,
     options.platform,
     options.environment,
   )) {
     if (client.configPathError !== undefined) {
-      statuses.push({
+      record({
         client: client.name,
         config_path: client.configPath,
         command: [],
@@ -104,7 +135,7 @@ export const readClientRegistrationStatuses = async (
     const manualRemediation = manualRegistrationRemediation(client.name);
     if (client.format === "unsupported") {
       if (manualRemediation !== undefined)
-        statuses.push({
+        record({
           client: client.name,
           config_path: client.markerPath ?? client.configPath,
           command: [],
@@ -119,7 +150,7 @@ export const readClientRegistrationStatuses = async (
         options.resources,
       );
       if (!files.ok) {
-        statuses.push({
+        record({
           client: client.name,
           config_path: client.configPath,
           command: [],
@@ -130,9 +161,7 @@ export const readClientRegistrationStatuses = async (
       }
       const parsed = effectiveClientConfiguration(files.value);
       if (parsed === undefined) {
-        statuses.push(
-          unavailableStatus(client.name, client.configPath, "missing"),
-        );
+        record(unavailableStatus(client, "missing"));
         continue;
       }
       const policy = await readClientPolicyBlock(
@@ -142,7 +171,7 @@ export const readClientRegistrationStatuses = async (
         options.resources,
       );
       if (!policy.ok) {
-        statuses.push({
+        record({
           client: client.name,
           config_path: client.configPath,
           command: [],
@@ -159,7 +188,7 @@ export const readClientRegistrationStatuses = async (
             ? dshDocument(parsed.document).editabilityError
             : undefined;
         if (editabilityError !== undefined) {
-          statuses.push({
+          record({
             client: client.name,
             config_path: client.configPath,
             command: [],
@@ -168,9 +197,7 @@ export const readClientRegistrationStatuses = async (
           });
           continue;
         }
-        statuses.push(
-          unavailableStatus(client.name, client.configPath, "missing"),
-        );
+        record(unavailableStatus(client, "missing"));
         continue;
       }
       const registration = parseRegistration(raw, client);
@@ -178,59 +205,67 @@ export const readClientRegistrationStatuses = async (
         registration.command,
         ...registration.args,
       ];
-      statuses.push(
+      const packageReference = clientRegistrationPackageReference(command);
+      const activation = registrationActivation(registration, client, parsed);
+      const packageVersion = exactRegisteredPackageVersion(packageReference);
+      const packageVersionDrift =
+        packageVersion !== undefined &&
+        packageVersion !== PRODUCT_IDENTITY.packageVersion;
+      record(
         configuredStatus(
-          client.name,
-          client.configPath,
+          client,
           command,
-          registrationAligned(
-            registration,
-            client,
-            currentCommandPath,
-            options.platform ?? process.platform,
-            clientServerForcedEnabled(parsed, PRODUCT_IDENTITY.mcpServerKey),
-          ) &&
-            !clientServerListedDisabled(
-              parsed,
-              PRODUCT_IDENTITY.mcpServerKey,
+          activation === "enabled" &&
+            !packageVersionDrift &&
+            registrationAligned(
+              registration,
+              client,
+              currentCommandPath,
+              options.platform ?? process.platform,
             ) &&
             (parsed.dialect !== "dsh" || dshDocument(parsed.document).ready) &&
             policyBlock === undefined
             ? "aligned"
             : "stale",
-          policyBlock,
+          policyBlock ??
+            (packageVersionDrift
+              ? packageVersionRemediation(packageReference ?? "", client)
+              : undefined),
+          packageReference,
         ),
+        activation,
       );
     } catch (cause: unknown) {
-      statuses.push(
-        unavailableStatus(
-          client.name,
-          client.configPath,
-          isMissing(cause) ? "missing" : "invalid",
-        ),
+      record(
+        unavailableStatus(client, isMissing(cause) ? "missing" : "invalid"),
       );
     }
   }
-  return statuses.sort((left, right) =>
-    compareUnicodeCodePoints(left.client, right.client),
+  return inspections.sort((left, right) =>
+    compareUnicodeCodePoints(left.status.client, right.status.client),
   );
 };
+
+const registrationActivation = (
+  registration: z.output<typeof registrationSchema>,
+  client: SetupClient,
+  parsed: ClientConfigurationDocument,
+): "enabled" | "disabled" =>
+  (client.format !== "grok" && registration.disabled === true) ||
+  (registration.enabled === false &&
+    !clientServerForcedEnabled(parsed, PRODUCT_IDENTITY.mcpServerKey)) ||
+  (client.format === "zcode" && registration.enable === false) ||
+  clientServerListedDisabled(parsed, PRODUCT_IDENTITY.mcpServerKey)
+    ? "disabled"
+    : "enabled";
 
 const registrationAligned = (
   registration: z.output<typeof registrationSchema>,
   client: SetupClient,
   currentCommandPath: string,
   platform: NodeJS.Platform,
-  forcedEnabled = false,
 ): boolean => {
   const command = [registration.command, ...registration.args];
-  if (
-    (client.format !== "grok" && registration.disabled === true) ||
-    (registration.enabled === false && !forcedEnabled) ||
-    // ZCode's native flag is `enable`; other dialects leave that field opaque.
-    (client.format === "zcode" && registration.enable === false)
-  )
-    return false;
   if (!isOwnedClientRegistrationCommand(command, currentCommandPath))
     return false;
   if (
@@ -239,19 +274,27 @@ const registrationAligned = (
       MCP_STARTUP_POLICY.codexStartupTimeoutSeconds
   )
     return false;
+  if (
+    client.name === "kimi" &&
+    (registration.startupTimeoutMs !==
+      MCP_STARTUP_POLICY.kimiStartupTimeoutMs ||
+      registration.toolTimeoutMs !== MCP_STARTUP_POLICY.kimiToolTimeoutMs)
+  )
+    return false;
+  if (
+    (client.format === "kimi" ||
+      client.format === "omp" ||
+      client.format === "pi") &&
+    registration.type !== undefined &&
+    registration.type !== "stdio"
+  )
+    return false;
   if (client.format === "vscode" && registration.type !== "stdio") return false;
   // A Harness registration only connects as the rea stdio server; another
   // server name or transport leaves the session without REA tools.
   if (
     client.format === "dsh" &&
     (registration.serverName !== "rea" || registration.transport !== "stdio")
-  )
-    return false;
-  // OMP and Pi infer stdio for a command entry without an explicit type.
-  if (
-    (client.format === "omp" || client.format === "pi") &&
-    registration.type !== undefined &&
-    registration.type !== "stdio"
   )
     return false;
   if (
@@ -313,6 +356,12 @@ const parseRegistration = (
   }
   const registration = registrationSchema.parse(value);
   if (
+    client.format === "kimi" &&
+    registration.transport !== undefined &&
+    registration.transport !== "stdio"
+  )
+    throw new TypeError("Expected an stdio registration");
+  if (
     (client.format === "vscode" || client.format === "copilot_cli") &&
     registration.type !== "stdio"
   )
@@ -320,7 +369,9 @@ const parseRegistration = (
   if (client.format === "commandcode" && registration.transport !== "stdio")
     throw new TypeError("Expected an stdio registration");
   if (
-    (client.format === "omp" || client.format === "pi") &&
+    (client.format === "kimi" ||
+      client.format === "omp" ||
+      client.format === "pi") &&
     registration.type !== undefined &&
     registration.type !== "stdio"
   )
@@ -328,36 +379,68 @@ const parseRegistration = (
   return registration;
 };
 
-const remediation =
-  "Run rea setup to refresh this registration, then restart the client.";
+/** A client that rewrites its file from memory must be quit before setup. */
+const remediation = (client: SetupClient): string => {
+  if (client.quitBeforeSetup !== true)
+    return "Run rea setup to refresh this registration, then restart the client.";
+  const name = client.displayName ?? client.name;
+  return `Quit ${name} fully, run rea setup to refresh this registration, then start ${name} again. A running ${name} can rewrite its configuration from memory and drop the registration.`;
+};
 
 const configuredStatus = (
-  client: string,
-  configPath: string,
+  client: SetupClient,
   command: RegistrationCommand,
   state: "aligned" | "stale",
   policyRemediation?: string,
+  packageReference?: string,
 ): ClientRegistrationStatus =>
   state === "aligned"
-    ? { client, config_path: configPath, command, state, remediation: null }
-    : {
-        client,
-        config_path: configPath,
+    ? {
+        client: client.name,
+        config_path: client.configPath,
         command,
+        ...(packageReference === undefined
+          ? {}
+          : { package_reference: packageReference }),
         state,
-        remediation: policyRemediation ?? remediation,
+        remediation: null,
+      }
+    : {
+        client: client.name,
+        config_path: client.configPath,
+        command,
+        ...(packageReference === undefined
+          ? {}
+          : { package_reference: packageReference }),
+        state,
+        remediation: policyRemediation ?? remediation(client),
       };
 
+const exactRegisteredPackageVersion = (
+  packageReference: string | undefined,
+): string | undefined => {
+  if (packageReference === undefined) return undefined;
+  const prefix = `${PRODUCT_IDENTITY.packageName}@`;
+  if (!packageReference.startsWith(prefix)) return undefined;
+  const version = packageReference.slice(prefix.length);
+  return valid(version) === version ? version : undefined;
+};
+
+const packageVersionRemediation = (
+  packageReference: string,
+  client: SetupClient,
+): string =>
+  `This registration requests ${packageReference}, while the current REA CLI package is ${PRODUCT_IDENTITY.packageVersion}. REA does not resolve package-runner requests during doctor; update the registration with rea setup --client ${client.name}, then restart the client.`;
+
 const unavailableStatus = (
-  client: string,
-  configPath: string,
+  client: SetupClient,
   state: "missing" | "invalid",
 ): ClientRegistrationStatus => ({
-  client,
-  config_path: configPath,
+  client: client.name,
+  config_path: client.configPath,
   command: [],
   state,
-  remediation,
+  remediation: remediation(client),
 });
 
 const clientEvidencePresent = async (client: SetupClient): Promise<boolean> => {
